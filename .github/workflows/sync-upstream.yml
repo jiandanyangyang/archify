@@ -67,66 +67,111 @@ jobs:
               return;
             }
 
-            const existingTags = new Set();
-            try {
-              const tags = await github.paginate(
-                'GET /repos/{owner}/{repo}/tags',
-                { owner, repo, per_page: 100 }
-              );
-              tags.forEach(t => existingTags.add(t.name));
-            } catch (e) {
-              core.warning(`Failed to list existing tags: ${e.message}`);
-            }
+            // Process oldest first so the final stable release is also marked latest.
+            upstreamReleases.sort(
+              (a, b) => new Date(a.published_at) - new Date(b.published_at)
+            );
 
-            let synced = 0;
+            let created = 0;
+            let updated = 0;
+            let uploaded = 0;
+
             for (const rel of upstreamReleases) {
-              if (existingTags.has(rel.tag_name)) continue;
-              core.info(`Syncing release: ${rel.tag_name} (${rel.name})`);
+              core.info(`Syncing release: ${rel.tag_name} (${rel.name || rel.tag_name})`);
 
-              const newRelease = await github.request('POST /repos/{owner}/{repo}/releases', {
-                owner, repo,
-                tag_name: rel.tag_name,
+              let targetRelease;
+              try {
+                const response = await github.rest.repos.getReleaseByTag({
+                  owner,
+                  repo,
+                  tag: rel.tag_name
+                });
+                targetRelease = response.data;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+
+              const releaseFields = {
+                owner,
+                repo,
                 name: rel.name || rel.tag_name,
                 body: rel.body || '',
                 draft: false,
                 prerelease: rel.prerelease,
-                make_latest: 'false'
-              });
+                make_latest: rel.prerelease ? 'false' : 'true'
+              };
+
+              if (targetRelease) {
+                const response = await github.rest.repos.updateRelease({
+                  ...releaseFields,
+                  release_id: targetRelease.id,
+                  tag_name: rel.tag_name
+                });
+                targetRelease = response.data;
+                updated++;
+              } else {
+                const response = await github.rest.repos.createRelease({
+                  ...releaseFields,
+                  tag_name: rel.tag_name
+                });
+                targetRelease = response.data;
+                created++;
+              }
+
+              const releaseAssets = await github.paginate(
+                github.rest.repos.listReleaseAssets,
+                {
+                  owner,
+                  repo,
+                  release_id: targetRelease.id,
+                  per_page: 100
+                }
+              );
+              const targetAssets = new Map(
+                releaseAssets.map(asset => [asset.name, asset])
+              );
 
               for (const asset of rel.assets) {
-                try {
-                  const dlResp = await fetch(asset.url, {
-                    headers: {
-                      Accept: 'application/octet-stream',
-                      Authorization: `token ${process.env.GITHUB_TOKEN}`,
-                      'User-Agent': 'sync-action'
-                    }
-                  });
-                  if (!dlResp.ok) {
-                    core.warning(`Failed to download ${asset.name}: ${dlResp.status}`);
-                    continue;
-                  }
-                  const buffer = Buffer.from(await dlResp.arrayBuffer());
-                  const uploadUrl = newRelease.data.upload_url.split('{')[0];
-                  const ulResp = await fetch(`${uploadUrl}?name=${encodeURIComponent(asset.name)}`, {
-                    method: 'POST',
-                    headers: {
-                      Authorization: `token ${process.env.GITHUB_TOKEN}`,
-                      'User-Agent': 'sync-action',
-                      'Content-Type': 'application/octet-stream',
-                      'Content-Length': buffer.length
-                    },
-                    body: buffer
-                  });
-                  if (!ulResp.ok) {
-                    core.warning(`Failed to upload ${asset.name}: ${ulResp.status} ${await ulResp.text()}`);
-                    continue;
-                  }
-                  core.info(`  Uploaded asset: ${asset.name}`);
-                } catch (e) {
-                  core.warning(`  Asset ${asset.name} failed: ${e.message}`);
+                const existingAsset = targetAssets.get(asset.name);
+                if (existingAsset && existingAsset.size === asset.size) {
+                  core.info(`  Asset already current: ${asset.name}`);
+                  continue;
                 }
+
+                if (existingAsset) {
+                  core.info(`  Replacing changed asset: ${asset.name}`);
+                  await github.rest.repos.deleteReleaseAsset({
+                    owner,
+                    repo,
+                    asset_id: existingAsset.id
+                  });
+                }
+
+                const download = await fetch(asset.browser_download_url);
+                if (!download.ok) {
+                  throw new Error(
+                    `Failed to download ${asset.name}: ${download.status} ${download.statusText}`
+                  );
+                }
+                const data = Buffer.from(await download.arrayBuffer());
+
+                await github.rest.repos.uploadReleaseAsset({
+                  owner,
+                  repo,
+                  release_id: targetRelease.id,
+                  name: asset.name,
+                  label: asset.label || undefined,
+                  data,
+                  headers: {
+                    'content-type': asset.content_type || 'application/octet-stream',
+                    'content-length': data.length
+                  }
+                });
+                core.info(`  Uploaded asset: ${asset.name}`);
+                uploaded++;
               }
-              synced++;
             }
-            core.info(`Synced ${synced} new release(s).`);
+
+            core.info(
+              `Release sync complete: ${created} created, ${updated} updated, ${uploaded} assets uploaded.`
+            );
